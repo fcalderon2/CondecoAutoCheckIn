@@ -1,0 +1,72 @@
+#Create a log for troubleshooting
+$logfiledate = Get-Date -Format MM_dd_yyyy
+Start-Transcript -Path "C:\Scripts\AutoCheckIn\log\autocheckin_$logfiledate.log" -Append -Force
+Get-Date
+
+
+# Define token file path and read token.  These are used for your vendor API platform.
+$tokenFilePath = "C:\Scripts\AutoCheckIn\token\access_token.txt"
+$accessToken = Get-Content -Path $tokenFilePath -Raw
+Write-Host "Access Token: $accessToken"
+
+# This is the csv file created by either a scheduled SQL job or an API GET request
+# that retrieves who has successfully entered the building/office aka polling every 2 minutes. 
+#Clean up CSV data and remove blank lines.
+#Clean up the invalid characters that appear in your csv output.
+Get-Content "C:\Scripts\Input\BadgeSwipeUsers.csv" | Where-Object { $_ -notlike '*----*' } | Out-File "C:\Scripts\Input\BadgeSwipeUsers_clean.csv"
+
+# Import cleaned CSV
+$csvData = Import-Csv -Path "C:\Scripts\Input\BadgeSwipeUsers_clean.csv"
+$csvData | Format-Table
+
+# Process badge data
+# My app required a valid email address that the building access could NOT provide. 
+# I used Active Directory to look up the accurate values.
+foreach ($badgeID in $csvData) {
+    $testA = '*' + $badgeID.TransactionCaption
+    $emailaddress = (Get-ADUser -Properties EmailAddress -Filter "ExtensionAttribute1 -like '$testA'").EmailAddress
+    Write-Host "Email Address: $emailaddress"
+    Write-Host "Location: $($badgeID.Area)"
+
+    # Location mapping (example)
+    switch -Regex ($badgeID.Area) {
+        '.*SLC.*' { $LocationID = "6" }
+        '.*NYC.*' { $LocationID = "24" }
+        '.*Nashville.*' { $LocationID = "11" }
+        default { $LocationID = "18" }
+    }
+
+    Write-Host "LocationID: $LocationID"
+
+    # API call
+    $url = "https://api.example.com/checkintolocation"
+    $headers = @{
+        "Content-Type" = "application/json"
+        "Authorization" = "Bearer $accessToken"
+    }
+    $body = @{
+        userEmail    = $emailaddress
+        locationId   = $LocationID
+        checkUserIn  = $true
+    } | ConvertTo-Json
+
+    $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Put -Body $body
+    Write-Host "Response: $response"
+}
+
+#If your enterprise can support MS Teams webhooks or posting to MS Teams channels via webhooks then... 
+#Post results to Teams webhook (example)
+$dte = Get-Date
+$escapedCsvContent = $csvData -replace "`n", "\n" -replace "`r", "\r" -replace "`t", "\t"
+$UserCount = Get-ADObject -Filter 'Created -gt $dte' | Measure-Object | Select-Object -ExpandProperty Count
+
+$webhookPayload = @{
+    "@type" = "MessageCard"
+    "@context" = "http://schema.org/extensions"
+    "themeColor" = "d58200"
+    "title" = "Auto Check-in - $dte"
+    "text" = "Checked-in users:\n```\n$escapedCsvContent\n```"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post -ContentType 'application/json' -Body $webhookPayload -Uri "https://yourteams.webhook.url"
+Stop-Transcript
